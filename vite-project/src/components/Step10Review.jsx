@@ -2515,17 +2515,30 @@ export default function Step10Review({
 
                                   <td style={{ padding: '10px 12px', fontSize: '0.8rem' }}>
                                     <div style={{ fontWeight: 700, color: '#0369a1' }}>{translateTerm(cow.stage, currentLang) || (currentLang === 'ta' ? 'நடுப்பருவம்' : currentLang === 'hi' ? 'मध्य दुग्धकाल' : 'Mid lactation')}</div>
-                                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginTop: '2px' }}>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '2px' }}>
                                       <span style={{ 
                                         background: cow.bcs <= 2.5 ? '#fee2e2' : '#f1f5f9', 
                                         color: cow.bcs <= 2.5 ? '#b91c1c' : '#475569', 
                                         padding: '1px 6px', 
                                         borderRadius: '6px', 
                                         fontSize: '0.72rem', 
-                                        fontWeight: 700 
+                                        fontWeight: 700,
+                                        display: 'inline-block',
+                                        width: 'fit-content'
                                       }}>
                                         BCS {cow.bcs ?? 3.0} {cow.bcs <= 2.5 ? (currentLang === 'ta' ? '(மெலிந்தது)' : currentLang === 'hi' ? '(कमजोर)' : '(Thin)') : ''}
+                                        {cow.targetBcs && Math.abs((cow.bcs ?? 3.0) - cow.targetBcs) >= 0.25 ? ` → Target ${cow.targetBcs}` : ''}
                                       </span>
+                                      {cow.mastitisStatus && cow.mastitisStatus !== 'healthy' && (
+                                        <span style={{ background: '#fef3c7', color: '#b45309', padding: '1px 6px', borderRadius: '6px', fontSize: '0.68rem', fontWeight: 800, width: 'fit-content' }}>
+                                          {cow.mastitisStatus === 'clinical_mastitis' ? 'Clinical Mastitis' : 'Subclinical Mastitis'}
+                                        </span>
+                                      )}
+                                      {Array.isArray(cow.detectedDiseases) && cow.detectedDiseases.map((dc, di) => (
+                                        <span key={di} style={{ background: '#ffe4e6', color: '#be123c', padding: '1px 6px', borderRadius: '6px', fontSize: '0.68rem', fontWeight: 800, width: 'fit-content' }}>
+                                          {String(dc).replace(/_/g, ' ').toUpperCase()}
+                                        </span>
+                                      ))}
                                     </div>
                                   </td>
                                   <td style={{ padding: '10px 12px', color: '#0284c7', fontWeight: 800 }}>
@@ -2601,6 +2614,73 @@ export default function Step10Review({
                           </table>
                         </div>
                       )}
+
+                      {/* Mooposhaq BCS Improvement & Mastitis / Disease Nutritional Prescriptions */}
+                      {(() => {
+                        const cowsWithHealthOrBcs = (calcResult.practicalFeedingReport?.perCategory?.milkingCow?.animals || []).filter(
+                          c => c.bcsNutritionPlan?.needsImprovement || (c.healthNutritionPlan?.activeDiagnoses?.length > 0)
+                        );
+                        if (cowsWithHealthOrBcs.length === 0) return null;
+                        return (
+                          <div style={{ background: '#fff7ed', border: '1.5px solid #fdba74', borderRadius: '12px', padding: '14px 16px', marginBottom: '16px' }}>
+                            <div style={{ fontWeight: 900, color: '#9a3412', fontSize: '0.9rem', marginBottom: '10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px' }}>
+                              <span>Mooposhaq BCS Conditioning & Mastitis / Disease Feed Prescriptions:</span>
+                              <span style={{ background: '#ea580c', color: '#ffffff', fontSize: '0.7rem', padding: '2px 8px', borderRadius: '999px', fontWeight: 800 }}>
+                                {cowsWithHealthOrBcs.length} Cow(s) Require Targeted Feed Adjustment
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                              {cowsWithHealthOrBcs.map((cow, cIdx) => {
+                                const bcsP = cow.bcsNutritionPlan;
+                                const hPlan = cow.healthNutritionPlan;
+                                const diags = hPlan?.activeDiagnoses || [];
+                                const supps = hPlan?.therapeuticSupplements || [];
+                                return (
+                                  <div key={cIdx} style={{ background: '#ffffff', border: '1px solid #fed7aa', borderRadius: '10px', padding: '10px 12px' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' }}>
+                                      <strong style={{ fontSize: '0.84rem', color: '#0f172a' }}>{stripEmojis(cow.title)}</strong>
+                                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                        {bcsP?.needsImprovement && (
+                                          <span style={{ background: '#ffedd5', color: '#c2410c', fontSize: '0.7rem', fontWeight: 800, padding: '2px 8px', borderRadius: '6px' }}>
+                                            {bcsP.statusLabel}
+                                          </span>
+                                        )}
+                                        {diags.map((d, di) => (
+                                          <span key={di} style={{ background: '#fee2e2', color: '#b91c1c', fontSize: '0.7rem', fontWeight: 800, padding: '2px 8px', borderRadius: '6px' }}>
+                                            {d.name}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                    {bcsP?.needsImprovement && (
+                                      <div style={{ fontSize: '0.78rem', color: '#1e293b', fontWeight: 700, marginBottom: '6px' }}>
+                                        • <strong>BCS Improvement:</strong> {bcsP.headline}
+                                      </div>
+                                    )}
+                                    {(hPlan?.farmSpecificFeedAdvice || []).map((adv, ai) => (
+                                      <div key={ai} style={{ fontSize: '0.76rem', color: '#0369a1', fontWeight: 600, marginBottom: '3px' }}>
+                                        • {adv}
+                                      </div>
+                                    ))}
+                                    {diags.map((d, di) => (
+                                      <div key={di} style={{ marginTop: '4px', fontSize: '0.75rem', color: '#991b1b' }}>
+                                        {(d.feedAdjustments || []).map((fa, fi) => (
+                                          <div key={fi} style={{ marginBottom: '2px' }}>→ {fa}</div>
+                                        ))}
+                                      </div>
+                                    ))}
+                                    {supps.length > 0 && (
+                                      <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px dashed #fed7aa', fontSize: '0.74rem', color: '#15803d', fontWeight: 700 }}>
+                                        <strong>Supplements:</strong> {supps.map(s => `${s.name} (${s.dosage})`).join(' | ')}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '16px' }}>
                         <div style={{ background: '#f8fafc', padding: '14px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
@@ -2811,6 +2891,7 @@ export default function Step10Review({
                         </div>
                       )}
 
+
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '16px' }}>
                         <div style={{ background: '#fffaf5', padding: '14px', borderRadius: '12px', border: '1px solid #fed7aa' }}>
                           <strong style={{ fontSize: '0.85rem', color: '#0f172a', display: 'block', marginBottom: '8px' }}>{currentLang === 'ta' ? 'சராசரியாக ஒரு மாட்டுக்கு:' : 'Average per Animal:'}</strong>
@@ -2967,6 +3048,7 @@ export default function Step10Review({
                           </table>
                         </div>
                       )}
+
 
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '16px' }}>
                         <div style={{ background: '#f8fafc', padding: '14px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
@@ -3141,6 +3223,7 @@ export default function Step10Review({
                         </div>
                       )}
 
+
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '16px' }}>
                         <div style={{ background: '#f8fafc', padding: '14px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
                           <strong style={{ fontSize: '0.85rem', color: '#0f172a', display: 'block', marginBottom: '8px' }}>{currentLang === 'ta' ? 'சராசரியாக ஒரு மாட்டுக்கு:' : 'Average per Cow:'}</strong>
@@ -3267,6 +3350,7 @@ export default function Step10Review({
                           </table>
                         </div>
                       )}
+
 
                       <div style={{ background: '#fef2f2', padding: '14px', borderRadius: '12px', border: '1px solid #fca5a5' }}>
                         <strong style={{ fontSize: '0.85rem', color: '#0f172a', display: 'block', marginBottom: '8px' }}>{currentLang === 'ta' ? 'சராசரியாக ஒரு காளைக்கு:' : 'Average per Bull:'}</strong>

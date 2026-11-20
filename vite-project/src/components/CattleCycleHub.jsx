@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ChevronLeft, ChevronRight, Check, Trash2, Copy, Sparkles, ArrowRight, AlertCircle, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Check, Trash2, Copy, Sparkles, ArrowRight, AlertCircle, X, Camera, HeartPulse } from 'lucide-react';
 import WeightChipSelect from './WeightChipSelect';
 import {
   COW_WEIGHT_RANGES,
@@ -7,6 +7,12 @@ import {
   BULL_WEIGHT_RANGES,
 } from '../data/weightRanges';
 import { ANIMAL_STAGE_TRANSLATIONS, translateTerm } from '../utils/tamilTranslations';
+import {
+  DISEASE_PROTOCOLS,
+  MASTITIS_OPTIONS,
+  DISEASE_OPTIONS,
+  calculateClientBcsEvaluation
+} from '../utils/bcsHealthEngine';
 
 // 5 Stages in the Cattle Production Cycle with Cartoon Images & Theme Colors
 const STAGES = [
@@ -113,7 +119,10 @@ const CALVING_REMAINING_CHIPS = [
 ];
 const BCS_OPTIONS = [
   { val: 2.0, label: 'Thin (2.0)' },
+  { val: 2.25, label: '2.25' },
+  { val: 2.5, label: '2.5' },
   { val: 3.0, label: 'Moderate (3.0)' },
+  { val: 3.25, label: '3.25' },
   { val: 3.5, label: 'Ideal (3.5)' },
   { val: 4.0, label: 'Heavy (4.0)' },
 ];
@@ -145,6 +154,7 @@ export default function CattleCycleHub({
   acknowledgeStep,
   onNext,
   onPrev,
+  onOpenAiScannerForCow,
   currentLang = 'ta',
   t,
 }) {
@@ -2415,24 +2425,48 @@ export default function CattleCycleHub({
                         </div>
                       </div>
 
-                      {/* Body Condition Score (BCS) */}
+                      {/* Body Condition Score (BCS) + AI Photo Scan */}
                       <div style={{ marginTop: '7px' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '3px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', gap: '6px', flexWrap: 'wrap' }}>
                           <label style={{ fontSize: '0.76rem', fontWeight: 800, color: '#334155' }}>
                             Body Condition Score (BCS)
                           </label>
-                          <span style={{ fontSize: '0.72rem', fontWeight: 800, color: curBcs !== '' ? activeStage.color : '#dc2626' }}>
-                            {curBcs !== '' ? `BCS ${curBcs}` : (currentLang === 'ta' ? 'தேர்வு செய்க' : currentLang === 'hi' ? 'BCS चुनें' : 'Select BCS')}
-                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            {onOpenAiScannerForCow && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenAiScannerForCow({ category: 'lactating', index: i, data: l })}
+                                style={{
+                                  background: 'linear-gradient(135deg, #0284c7 0%, #1d4ed8 100%)',
+                                  color: '#ffffff',
+                                  border: 'none',
+                                  borderRadius: '8px',
+                                  padding: '3px 8px',
+                                  fontSize: '0.68rem',
+                                  fontWeight: 800,
+                                  cursor: 'pointer',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px'
+                                }}
+                              >
+                                <Camera size={12} />
+                                <span>Scan Cow Photo (AI BCS & Disease)</span>
+                              </button>
+                            )}
+                            <span style={{ fontSize: '0.72rem', fontWeight: 800, color: curBcs !== '' ? activeStage.color : '#dc2626' }}>
+                              {curBcs !== '' ? `BCS ${curBcs}` : (currentLang === 'ta' ? 'தேர்வு செய்க' : currentLang === 'hi' ? 'BCS चुनें' : 'Select BCS')}
+                            </span>
+                          </div>
                         </div>
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
                           {BCS_OPTIONS.map(opt => {
-                            const isSel = curBcs !== '' && Math.abs(Number(curBcs) - opt.val) < 0.1;
+                            const isSel = curBcs !== '' && Math.abs(Number(curBcs) - opt.val) < 0.08;
                             return (
                               <button
                                 key={opt.val}
                                 type="button"
-                                onClick={() => updateLactating(i, 'bcs', opt.val)}
+                                onClick={() => updateLactating(i, { bcs: opt.val, applyBcsConditioning: true })}
                                 style={{
                                   padding: '3px 8px', borderRadius: '10px',
                                   border: `1.5px solid ${isSel ? activeStage.color : '#e2e8f0'}`,
@@ -2446,6 +2480,88 @@ export default function CattleCycleHub({
                             );
                           })}
                         </div>
+                      </div>
+
+                      {/* Mastitis & Disease Diagnosis Link to Mooposhaq Feed */}
+                      <div style={{ marginTop: '7px', padding: '7px 9px', borderRadius: '10px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
+                          <span style={{ fontSize: '0.72rem', fontWeight: 800, color: '#334155', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <HeartPulse size={13} color="#dc2626" />
+                            <span>Mastitis & Health Diagnosis (Mooposhaq Therapeutic Feed):</span>
+                          </span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '6px' }}>
+                          <div>
+                            <label style={{ fontSize: '0.66rem', fontWeight: 700, color: '#64748b', display: 'block', marginBottom: '2px' }}>
+                              Mastitis Model Status
+                            </label>
+                            <select
+                              value={l.mastitisStatus || 'healthy'}
+                              onChange={e => updateLactating(i, { mastitisStatus: e.target.value, applyBcsConditioning: true })}
+                              style={{
+                                width: '100%', padding: '4px 6px', borderRadius: '7px',
+                                border: `1.5px solid ${(l.mastitisStatus && l.mastitisStatus !== 'healthy') ? '#f59e0b' : '#cbd5e1'}`,
+                                background: (l.mastitisStatus && l.mastitisStatus !== 'healthy') ? '#fffbeb' : '#ffffff',
+                                fontSize: '0.72rem', fontWeight: 700, color: '#0f172a'
+                              }}
+                            >
+                              {MASTITIS_OPTIONS.map(m => (
+                                <option key={m.val} value={m.val}>{m.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label style={{ fontSize: '0.66rem', fontWeight: 700, color: '#64748b', display: 'block', marginBottom: '2px' }}>
+                              Disease Model Diagnosis
+                            </label>
+                            <select
+                              value={l.healthDiagnosis || 'healthy'}
+                              onChange={e => updateLactating(i, {
+                                healthDiagnosis: e.target.value,
+                                diseases: e.target.value !== 'healthy' ? [e.target.value] : [],
+                                applyBcsConditioning: true
+                              })}
+                              style={{
+                                width: '100%', padding: '4px 6px', borderRadius: '7px',
+                                border: `1.5px solid ${(l.healthDiagnosis && l.healthDiagnosis !== 'healthy') ? '#ef4444' : '#cbd5e1'}`,
+                                background: (l.healthDiagnosis && l.healthDiagnosis !== 'healthy') ? '#fef2f2' : '#ffffff',
+                                fontSize: '0.72rem', fontWeight: 700, color: '#0f172a'
+                              }}
+                            >
+                              {DISEASE_OPTIONS.map(dOpt => (
+                                <option key={dOpt.val} value={dOpt.val}>{dOpt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+
+                        {/* Live Mooposhaq BCS & Disease Feed Advisory Pill */}
+                        {(() => {
+                          const bcsPlan = curBcs !== '' ? calculateClientBcsEvaluation(curBcs, l.weight || 450, 'milkingCow', l.stage || 'Mid lactation') : null;
+                          const mastProt = (l.mastitisStatus && l.mastitisStatus !== 'healthy') ? DISEASE_PROTOCOLS[l.mastitisStatus] : null;
+                          const disProt = (l.healthDiagnosis && l.healthDiagnosis !== 'healthy') ? DISEASE_PROTOCOLS[l.healthDiagnosis] : null;
+                          if ((!bcsPlan || !bcsPlan.needsImprovement) && !mastProt && !disProt) return null;
+
+                          return (
+                            <div style={{ marginTop: '6px', padding: '6px 8px', borderRadius: '8px', background: '#fff7ed', border: '1px solid #fed7aa', fontSize: '0.7rem', color: '#9a3412' }}>
+                              {bcsPlan && bcsPlan.needsImprovement && (
+                                <div style={{ fontWeight: 800, marginBottom: (mastProt || disProt) ? '3px' : 0 }}>
+                                  • BCS {bcsPlan.currentBcs} → Target {bcsPlan.targetBcs}: Mooposhaq adds {bcsPlan.extraMeMcalPerDay >= 0 ? `+${bcsPlan.extraMeMcalPerDay}` : bcsPlan.extraMeMcalPerDay} Mcal ME/d ({bcsPlan.practicalFeedDelta.energyConcentrateDeltaKg >= 0 ? `+${bcsPlan.practicalFeedDelta.energyConcentrateDeltaKg}` : bcsPlan.practicalFeedDelta.energyConcentrateDeltaKg} kg conc/day for ~{bcsPlan.estimatedConditioningDays}d)
+                                </div>
+                              )}
+                              {mastProt && (
+                                <div style={{ fontWeight: 700, color: '#b45309' }}>
+                                  • {mastProt.shortLabel}: +40–50% Chelated Mineral Mix (Zn, Se, Vit E), +15% fresh green fodder, cap Conc &lt;= {mastProt.maxConcDmPct}% DMI
+                                </div>
+                              )}
+                              {disProt && (
+                                <div style={{ fontWeight: 700, color: '#b91c1c' }}>
+                                  • {disProt.shortLabel}: {disProt.preferSoftMash ? 'Soft Wet-Mash with Cane Molasses (0.6 kg/d) + Finely Chaffed Greens + ' : ''}+{Math.round((disProt.cpMultiplier - 1) * 100)}% CP & +{Math.round((disProt.mineralMixMultiplier - 1) * 100)}% Minerals
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
 
                       {/* Lactation Stage / DIM */}

@@ -157,7 +157,12 @@ export async function runNutritionCalculation(farmData) {
     heifersData: (farmData.heifersData || []).map(h => ({
       id: String(h.id || ''),
       weight: Number(h.weight) || 300,
-      ageMonths: Number(h.ageMonths) || 24
+      ageMonths: Number(h.ageMonths) || 24,
+      bcs: h.bcs !== undefined && h.bcs !== '' ? Number(h.bcs) : 3.25,
+      mastitisStatus: h.mastitisStatus || 'healthy',
+      healthDiagnosis: h.healthDiagnosis || 'healthy',
+      diseases: Array.isArray(h.diseases) ? h.diseases : (h.healthDiagnosis && h.healthDiagnosis !== 'healthy' ? [h.healthDiagnosis] : []),
+      applyBcsConditioning: Boolean(h.applyBcsConditioning)
     })),
     pregnantCategory: farmData.pregnantCategory || 'both',
     firstTimeCattle: (farmData.firstTimeCattle || []).map(c => {
@@ -167,7 +172,12 @@ export async function runNutritionCalculation(farmData) {
         weight: Number(c.weight) || 350,
         pregMonth: pm,
         gestationalMonths: pm,
-        pregDays: Number(c.pregDays) || (pm * 30)
+        pregDays: Number(c.pregDays) || (pm * 30),
+        bcs: c.bcs !== undefined && c.bcs !== '' ? Number(c.bcs) : 3.35,
+        mastitisStatus: c.mastitisStatus || 'healthy',
+        healthDiagnosis: c.healthDiagnosis || 'healthy',
+        diseases: Array.isArray(c.diseases) ? c.diseases : (c.healthDiagnosis && c.healthDiagnosis !== 'healthy' ? [c.healthDiagnosis] : []),
+        applyBcsConditioning: Boolean(c.applyBcsConditioning)
       };
     }),
     repeatCattle: (farmData.repeatCattle || []).map(c => {
@@ -177,7 +187,12 @@ export async function runNutritionCalculation(farmData) {
         weight: Number(c.weight) || 450,
         pregMonth: pm,
         gestationalMonths: pm,
-        pregDays: Number(c.pregDays) || (pm * 30)
+        pregDays: Number(c.pregDays) || (pm * 30),
+        bcs: c.bcs !== undefined && c.bcs !== '' ? Number(c.bcs) : 3.35,
+        mastitisStatus: c.mastitisStatus || 'healthy',
+        healthDiagnosis: c.healthDiagnosis || 'healthy',
+        diseases: Array.isArray(c.diseases) ? c.diseases : (c.healthDiagnosis && c.healthDiagnosis !== 'healthy' ? [c.healthDiagnosis] : []),
+        applyBcsConditioning: Boolean(c.applyBcsConditioning)
       };
     }),
     lactatingData: (farmData.lactatingData || []).map(l => {
@@ -196,7 +211,11 @@ export async function runNutritionCalculation(farmData) {
         lactationType: isFirst ? 'first_lactation' : 'second_plus',
         isFirstLactation: isFirst,
         parity: isFirst ? 1 : 2,
-        dim: Number(l.dim) || (stageVal.includes('Early') ? 30 : stageVal.includes('Late') ? 210 : 90)
+        dim: Number(l.dim) || (stageVal.includes('Early') ? 30 : stageVal.includes('Late') ? 210 : 90),
+        mastitisStatus: l.mastitisStatus || 'healthy',
+        healthDiagnosis: l.healthDiagnosis || 'healthy',
+        diseases: Array.isArray(l.diseases) ? l.diseases : (l.healthDiagnosis && l.healthDiagnosis !== 'healthy' ? [l.healthDiagnosis] : []),
+        applyBcsConditioning: Boolean(l.applyBcsConditioning)
       };
     }),
     dryCowsData: (farmData.dryCowsData || []).map(d => ({
@@ -205,11 +224,20 @@ export async function runNutritionCalculation(farmData) {
       dryDays: Number(d.dryDays !== undefined && d.dryDays !== '' ? d.dryDays : 45),
       daysToCalving: Number(d.daysToCalving !== undefined && d.daysToCalving !== '' ? d.daysToCalving : 21),
       bcs: Number(d.bcs !== undefined && d.bcs !== '' ? d.bcs : 3.5),
+      mastitisStatus: d.mastitisStatus || 'healthy',
+      healthDiagnosis: d.healthDiagnosis || 'healthy',
+      diseases: Array.isArray(d.diseases) ? d.diseases : (d.healthDiagnosis && d.healthDiagnosis !== 'healthy' ? [d.healthDiagnosis] : []),
+      applyBcsConditioning: Boolean(d.applyBcsConditioning)
     })),
     bullsData: (farmData.bullsData || []).map(b => ({
       id: String(b.id || ''),
       weight: Number(b.weight) || 550,
       purpose: b.purpose || 'Breeding Bull',
+      bcs: b.bcs !== undefined && b.bcs !== '' ? Number(b.bcs) : 3.25,
+      mastitisStatus: 'healthy',
+      healthDiagnosis: b.healthDiagnosis || 'healthy',
+      diseases: Array.isArray(b.diseases) ? b.diseases : (b.healthDiagnosis && b.healthDiagnosis !== 'healthy' ? [b.healthDiagnosis] : []),
+      applyBcsConditioning: Boolean(b.applyBcsConditioning)
     })),
     grazingSystem: farmData.grazingSystem || 'no_grazing',
     grazingData: farmData.grazingData || {},
@@ -241,3 +269,124 @@ export async function runNutritionCalculation(farmData) {
 
   return await res.json();
 }
+
+/**
+ * Helper to call an external microservice directly from the browser (if configured)
+ * using multipart/form-data with automatic JSON base64 fallback.
+ */
+async function callExternalMicroserviceFromClient(endpointUrl, file) {
+  if (!endpointUrl || !file) return null;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('image', file);
+    const res = await fetch(endpointUrl, { method: 'POST', body: fd });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    console.warn(`Direct client call to ${endpointUrl} failed, backend will handle or fallback:`, e);
+  }
+  return null;
+}
+
+/**
+ * Analyzes a cow photo via external BCS, Mastitis, and Disease microservices
+ * and returns complete Mooposhaq feed recommendations to improve BCS and treat/support diagnoses.
+ */
+export async function analyzeCowImageAndRecommendFeed({
+  file = null,
+  category = 'milkingCow',
+  weight = 450,
+  milkYield = 12,
+  milkFat = 4.2,
+  stage = 'Mid lactation',
+  isFirstLactation = false,
+  pregMonth = 7,
+  dryDays = 45,
+  bcsModelUrl = '',
+  mastitisModelUrl = '',
+  diseaseModelUrl = '',
+  overrideBcs = null,
+  overrideMastitis = null,
+  overrideDiseases = [],
+  selectedFeeds = [],
+  selectedBreed = null,
+  weather = null
+}) {
+  const url = await getActiveApiUrl();
+
+  // If external microservice URLs are localhost and user is running frontend locally,
+  // try calling them from client too in case backend is remote Render cloud
+  let clientBcs = overrideBcs;
+  let clientMast = overrideMastitis;
+  let clientDis = Array.isArray(overrideDiseases) ? [...overrideDiseases] : [];
+
+  if (file && bcsModelUrl && clientBcs === null) {
+    const bcsData = await callExternalMicroserviceFromClient(bcsModelUrl, file);
+    if (bcsData) {
+      const rawScore = bcsData.bcs ?? bcsData.bcs_score ?? bcsData.score ?? bcsData.prediction;
+      if (rawScore !== undefined && !isNaN(parseFloat(rawScore))) {
+        clientBcs = Math.round(parseFloat(rawScore) * 4) / 4;
+      }
+    }
+  }
+  if (file && mastitisModelUrl && !clientMast) {
+    const mastData = await callExternalMicroserviceFromClient(mastitisModelUrl, file);
+    if (mastData) {
+      clientMast = mastData.mastitis ?? mastData.diagnosis ?? mastData.prediction ?? mastData.status ?? null;
+    }
+  }
+  if (file && diseaseModelUrl && clientDis.length === 0) {
+    const disData = await callExternalMicroserviceFromClient(diseaseModelUrl, file);
+    if (disData) {
+      const d = disData.disease ?? disData.diagnosis ?? disData.prediction ?? disData.label;
+      if (d) clientDis.push(String(d));
+    }
+  }
+
+  const fd = new FormData();
+  if (file) fd.append('file', file);
+  fd.append('category', String(category || 'milkingCow'));
+  fd.append('weight', String(Number(weight) || 450));
+  fd.append('milkYield', String(Number(milkYield) || 12));
+  fd.append('milkFat', String(Number(milkFat) || 4.2));
+  fd.append('stage', String(stage || 'Mid lactation'));
+  fd.append('isFirstLactation', String(Boolean(isFirstLactation)));
+  fd.append('pregMonth', String(Number(pregMonth) || 7));
+  fd.append('dryDays', String(Number(dryDays) || 45));
+  if (bcsModelUrl) fd.append('bcsModelUrl', bcsModelUrl);
+  if (mastitisModelUrl) fd.append('mastitisModelUrl', mastitisModelUrl);
+  if (diseaseModelUrl) fd.append('diseaseModelUrl', diseaseModelUrl);
+  if (clientBcs !== null && clientBcs !== undefined && clientBcs !== '') {
+    fd.append('overrideBcs', String(clientBcs));
+  }
+  if (clientMast) {
+    fd.append('overrideMastitis', String(clientMast));
+  }
+  if (clientDis.length > 0) {
+    fd.append('overrideDiseasesJson', JSON.stringify(clientDis));
+  }
+  if (selectedFeeds && selectedFeeds.length > 0) {
+    fd.append('selectedFeedsJson', JSON.stringify(selectedFeeds));
+  }
+  if (selectedBreed) {
+    fd.append('selectedBreedJson', JSON.stringify(selectedBreed));
+  }
+  if (weather) {
+    fd.append('weatherJson', JSON.stringify(weather));
+  }
+
+  const res = await fetch(`${url}/api/ai/analyze-cow`, {
+    method: 'POST',
+    body: fd
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`AI Cow Analysis failed (${res.status}): ${errText}`);
+  }
+
+  return await res.json();
+}
+
