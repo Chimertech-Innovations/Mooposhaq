@@ -2,11 +2,24 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 import math
+import json
+import base64
 import numpy as np
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from ai_diagnostics import (
+    DISEASE_NUTRITION_PROTOCOLS,
+    DEFAULT_BCS_MODEL_URL,
+    DEFAULT_MASTITIS_MODEL_URL,
+    DEFAULT_DISEASE_MODEL_URL,
+    normalize_disease_code,
+    calculate_bcs_nutrition_adjustment,
+    build_combined_cow_health_prescription,
+    run_all_external_models_on_image,
+)
 
 from nutrition_engine import (
     tempHumData,
@@ -111,6 +124,10 @@ class AnimalItem(BaseModel):
     dryDays: Optional[int] = None
     lactationType: Optional[str] = "second_plus"
     isFirstLactation: Optional[bool] = False
+    mastitisStatus: Optional[str] = None
+    healthDiagnosis: Optional[str] = None
+    diseases: Optional[List[str]] = None
+    applyBcsConditioning: Optional[bool] = False
 
 class FeedItem(BaseModel):
     id: Optional[str] = None
@@ -659,13 +676,74 @@ def calculate_feed_nutrition(req: NutritionRequest):
 
     # Structure all animal entities for joint farm-level multi-class optimization
     animal_entities = []
+    selected_feeds_dicts = [
+        {"name": f.name, "category": f.category, "quantityKg": f.quantityKg, "dmPct": f.dmPct}
+        for f in (req.selectedFeeds or [])
+    ]
+
+    def _extract_cow_diseases(cow_obj: AnimalItem) -> List[str]:
+        codes: List[str] = []
+        if cow_obj.healthDiagnosis:
+            c = normalize_disease_code(cow_obj.healthDiagnosis)
+            if c != "healthy":
+                codes.append(c)
+        for d in (cow_obj.diseases or []):
+            c = normalize_disease_code(d)
+            if c != "healthy" and c not in codes:
+                codes.append(c)
+        return codes
+
+    def _apply_health_and_bcs_to_entity(
+        cow_obj: AnimalItem,
+        cat_name: str,
+        stage_name: str,
+        bcs_default: float,
+        base_record: Dict[str, Any],
+        trough_dmi_val: float,
+        trough_nel_val: float,
+        trough_cp_val: float,
+        milk_val: float = 0.0,
+        fat_val: float = 4.2
+    ):
+        bcs_num = float(cow_obj.bcs if cow_obj.bcs is not None else bcs_default)
+        dis_list = _extract_cow_diseases(cow_obj)
+        mast_code = normalize_disease_code(cow_obj.mastitisStatus) if cow_obj.mastitisStatus else "healthy"
+        prescription = build_combined_cow_health_prescription(
+            bcs=bcs_num,
+            bw=cow_obj.weight,
+            category=cat_name,
+            stage=stage_name,
+            milk_yield=milk_val,
+            milk_fat=fat_val,
+            mastitis_status=mast_code,
+            disease_codes=dis_list,
+            selected_feeds=selected_feeds_dicts
+        )
+        has_active_disease = (mast_code != "healthy") or (len(dis_list) > 0)
+        should_modify_solver = bool(cow_obj.applyBcsConditioning) or has_active_disease
+
+        if should_modify_solver:
+            qmod = prescription["quantitativeModifiers"]
+            # Apply BCS reserve recovery delta (if applyBcsConditioning or thin cow with diagnosis) and disease multipliers
+            nel_boost = qmod["extraNelMcal"] if cow_obj.applyBcsConditioning else 0.0
+            cp_boost = qmod["extraCpG"] if cow_obj.applyBcsConditioning else 0.0
+            dmi_boost = prescription["bcsEvaluation"]["extraDmiKgPerDay"] if cow_obj.applyBcsConditioning else 0.0
+
+            new_trough_nel = max(0.1, round((trough_nel_val + nel_boost) * qmod["nelDiseaseMultiplier"], 2))
+            new_trough_cp = max(0.0, round((trough_cp_val + cp_boost) * qmod["cpDiseaseMultiplier"], 1))
+            new_trough_dmi = max(0.1, round((trough_dmi_val + dmi_boost) * qmod["dmiDiseaseMultiplier"], 2))
+
+            base_record["caG"] = round(base_record["caG"] * qmod["caMultiplier"], 1)
+            base_record["pG"] = round(base_record["pG"] * qmod["pMultiplier"], 1)
+            return bcs_num, mast_code, dis_list, prescription, should_modify_solver, new_trough_dmi, new_trough_nel, new_trough_cp
+
+        return bcs_num, mast_code, dis_list, prescription, should_modify_solver, trough_dmi_val, trough_nel_val, trough_cp_val
 
     # 1. Milking Cows
     lact_recs = [rec for rec in animal_records if rec["category"] == "milkingCow"]
     for i, (cow, a) in enumerate(zip(lactating, lact_recs)):
         milk = float(cow.milkYield or 0.0)
         fat_val = float(cow.milkFat if cow.milkFat is not None else (cow.fatPct if cow.fatPct is not None else target_fat))
-        bcs_val = float(cow.bcs if cow.bcs is not None else 3.0)
         stg = cow.stage or "Mid lactation"
         is_first = a.get("isFirstLactation", False)
 
@@ -676,6 +754,10 @@ def calculate_feed_nutrition(req: NutritionRequest):
         trough_dmi = max(0.1, round(a["dmiKg"] - pasture_dm, 2))
         trough_nel = max(0.1, round(a.get("nelMcal", a["meMcal"] * 0.66) - (pasture_dm * 1.32), 2))
         trough_cp = max(0.0, round(a["cpG"] - (pasture_dm * 100.0), 1))
+
+        bcs_val, mast_code, dis_list, prescription, mod_active, trough_dmi, trough_nel, trough_cp = _apply_health_and_bcs_to_entity(
+            cow, "milkingCow", stg, 3.0, a, trough_dmi, trough_nel, trough_cp, milk_val=milk, fat_val=fat_val
+        )
 
         animal_entities.append({
             "id": f"milking_{i+1}",
@@ -689,6 +771,10 @@ def calculate_feed_nutrition(req: NutritionRequest):
             "milkYieldL": milk,
             "milkFatPct": fat_val,
             "bcs": bcs_val,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_list,
+            "healthPrescription": prescription,
+            "healthModifierActive": mod_active,
             "stage": stg,
             "target_dmi_kg": trough_dmi,
             "target_nel_mcal": trough_nel,
@@ -706,6 +792,7 @@ def calculate_feed_nutrition(req: NutritionRequest):
         pm = cow.pregMonth if cow.pregMonth is not None else 6
         is_late = pm >= 6
         is_heif = i < len(first_time_preg)
+        stg_preg = classify_pregnancy_stage(pm)
 
         pasture_dm = calculate_scientific_pasture_intake(
             bw=cow.weight, hours=hrs_preg, grazing_system=loc_preg,
@@ -715,6 +802,10 @@ def calculate_feed_nutrition(req: NutritionRequest):
         trough_nel = max(0.1, round(a.get("nelMcal", a["meMcal"] * 0.66) - (pasture_dm * 1.32), 2))
         trough_cp = max(0.0, round(a["cpG"] - (pasture_dm * 100.0), 1))
 
+        bcs_val, mast_code, dis_list, prescription, mod_active, trough_dmi, trough_nel, trough_cp = _apply_health_and_bcs_to_entity(
+            cow, "pregnantCattle", stg_preg, 3.35, a, trough_dmi, trough_nel, trough_cp
+        )
+
         animal_entities.append({
             "id": f"preg_{i+1}",
             "index": i + 1,
@@ -723,7 +814,12 @@ def calculate_feed_nutrition(req: NutritionRequest):
             "type": "First Pregnancy" if is_heif else "Repeat Pregnancy",
             "weightKg": cow.weight,
             "pregMonth": pm,
-            "stage": classify_pregnancy_stage(pm),
+            "stage": stg_preg,
+            "bcs": bcs_val,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_list,
+            "healthPrescription": prescription,
+            "healthModifierActive": mod_active,
             "target_dmi_kg": trough_dmi,
             "target_nel_mcal": trough_nel,
             "target_cp_g": trough_cp,
@@ -744,12 +840,21 @@ def calculate_feed_nutrition(req: NutritionRequest):
         trough_nel = max(0.1, round(a.get("nelMcal", a["meMcal"] * 0.66) - (pasture_dm * 1.32), 2))
         trough_cp = max(0.0, round(a["cpG"] - (pasture_dm * 100.0), 1))
 
+        bcs_val, mast_code, dis_list, prescription, mod_active, trough_dmi, trough_nel, trough_cp = _apply_health_and_bcs_to_entity(
+            cow, "growingHeifer", "Growing Heifer", 3.25, a, trough_dmi, trough_nel, trough_cp
+        )
+
         animal_entities.append({
             "id": f"heifer_{i+1}",
             "index": i + 1,
             "category": "growingHeifer",
             "title": f"Growing Heifer #{i+1}",
             "weightKg": cow.weight,
+            "bcs": bcs_val,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_list,
+            "healthPrescription": prescription,
+            "healthModifierActive": mod_active,
             "target_dmi_kg": trough_dmi,
             "target_nel_mcal": trough_nel,
             "target_cp_g": trough_cp,
@@ -771,6 +876,10 @@ def calculate_feed_nutrition(req: NutritionRequest):
         trough_nel = max(0.1, round(a.get("nelMcal", a["meMcal"] * 0.66) - (pasture_dm * 1.32), 2))
         trough_cp = max(0.0, round(a["cpG"] - (pasture_dm * 100.0), 1))
 
+        bcs_val, mast_code, dis_list, prescription, mod_active, trough_dmi, trough_nel, trough_cp = _apply_health_and_bcs_to_entity(
+            cow, "dryCow", "Dry Period", 3.50, a, trough_dmi, trough_nel, trough_cp
+        )
+
         animal_entities.append({
             "id": f"dry_{i+1}",
             "index": i + 1,
@@ -778,6 +887,11 @@ def calculate_feed_nutrition(req: NutritionRequest):
             "title": f"Dry Cow #{i+1}",
             "weightKg": cow.weight,
             "dryDays": days,
+            "bcs": bcs_val,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_list,
+            "healthPrescription": prescription,
+            "healthModifierActive": mod_active,
             "target_dmi_kg": trough_dmi,
             "target_nel_mcal": trough_nel,
             "target_cp_g": trough_cp,
@@ -798,12 +912,21 @@ def calculate_feed_nutrition(req: NutritionRequest):
         trough_nel = max(0.1, round(a.get("nelMcal", a["meMcal"] * 0.66) - (pasture_dm * 1.32), 2))
         trough_cp = max(0.0, round(a["cpG"] - (pasture_dm * 100.0), 1))
 
+        bcs_val, mast_code, dis_list, prescription, mod_active, trough_dmi, trough_nel, trough_cp = _apply_health_and_bcs_to_entity(
+            cow, "bull", "Breeding Bull", 3.25, a, trough_dmi, trough_nel, trough_cp
+        )
+
         animal_entities.append({
             "id": f"bull_{i+1}",
             "index": i + 1,
             "category": "bull",
             "title": f"Breeding Bull #{i+1}",
             "weightKg": cow.weight,
+            "bcs": bcs_val,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_list,
+            "healthPrescription": prescription,
+            "healthModifierActive": mod_active,
             "target_dmi_kg": trough_dmi,
             "target_nel_mcal": trough_nel,
             "target_cp_g": trough_cp,
@@ -932,6 +1055,16 @@ def calculate_feed_nutrition(req: NutritionRequest):
             diet_k_pct=1.40,
             temp_c=temp
         )
+
+        # Apply Mastitis / Disease / BCS Conditioning therapeutic mineral & water boosts when active
+        hp = ent.get("healthPrescription") or {}
+        bcs_eval = hp.get("bcsEvaluation") or {}
+        if ent.get("healthModifierActive"):
+            qmod = hp.get("quantitativeModifiers") or {}
+            animal_min_g = int(round(min(220.0, animal_min_g * float(qmod.get("mineralMixMultiplier", 1.0)))))
+            animal_salt_g = int(round(animal_salt_g * float(qmod.get("saltMultiplier", 1.0))))
+            anim_water = round(anim_water * float(qmod.get("waterMultiplier", 1.0)), 1)
+
         a["fwiL"] = anim_water
 
         entry = {
@@ -940,6 +1073,12 @@ def calculate_feed_nutrition(req: NutritionRequest):
             "title": ent["title"],
             "category": cat,
             "weightKg": ent["weightKg"],
+            "bcs": ent.get("bcs", 3.0),
+            "targetBcs": bcs_eval.get("targetBcs", 3.25),
+            "bcsNutritionPlan": bcs_eval,
+            "mastitisStatus": ent.get("mastitisStatus", "healthy"),
+            "detectedDiseases": ent.get("detectedDiseases", []),
+            "healthNutritionPlan": hp,
             "greenFodderKg": green_fresh,
             "greenFodderDetails": green_details,
             "dryFodderKg": dry_fresh,
@@ -1997,9 +2136,50 @@ def calculate_feed_nutrition(req: NutritionRequest):
     )
     practical_report["ktFormulation"] = kt_formulation
 
+    # Aggregate Herd BCS Improvement & Disease/Mastitis Feed Prescriptions
+    bcs_health_animals = []
+    for anim in all_solved_animals:
+        hp = anim.get("healthNutritionPlan") or {}
+        bcs_ev = anim.get("bcsNutritionPlan") or {}
+        active_diag = hp.get("activeDiagnoses") or []
+        if bcs_ev.get("needsImprovement") or len(active_diag) > 0:
+            bcs_health_animals.append({
+                "id": anim["id"],
+                "title": anim["title"],
+                "category": anim["category"],
+                "weightKg": anim["weightKg"],
+                "currentBcs": anim.get("bcs", 3.0),
+                "targetBcs": anim.get("targetBcs", 3.25),
+                "bcsEvaluation": bcs_ev,
+                "mastitisStatus": anim.get("mastitisStatus", "healthy"),
+                "detectedDiseases": anim.get("detectedDiseases", []),
+                "activeDiagnoses": active_diag,
+                "farmSpecificFeedAdvice": hp.get("farmSpecificFeedAdvice", []),
+                "therapeuticSupplements": hp.get("therapeuticSupplements", []),
+                "recommendedDailyRation": {
+                    "greenFodderKg": anim.get("greenFodderKg", 0.0),
+                    "greenFodderDetails": anim.get("greenFodderDetails", ""),
+                    "dryFodderKg": anim.get("dryFodderKg", 0.0),
+                    "dryFodderDetails": anim.get("dryFodderDetails", ""),
+                    "concentrateKg": anim.get("concentrateKg", 0.0),
+                    "concentrateDetails": anim.get("concentrateDetails", ""),
+                    "mineralMixtureG": anim.get("mineralMixtureG", 50),
+                    "saltG": anim.get("saltG", 30),
+                    "waterLiters": anim.get("waterLiters", 50.0)
+                }
+            })
+
+    bcs_and_health_summary = {
+        "totalAnimalsEvaluated": len(all_solved_animals),
+        "animalsNeedingBcsOrHealthAction": len(bcs_health_animals),
+        "animals": bcs_health_animals
+    }
+    practical_report["bcsAndHealthPrescriptions"] = bcs_and_health_summary
+
     return {
         "success": True,
         "practicalFeedingReport": practical_report,
+        "bcsAndHealthPrescriptions": bcs_and_health_summary,
         "ktFormulation": kt_formulation,
         "regionalFeedIntelligence": regional_recs,
         "rumenFiberHealth": rumen_health,
@@ -2122,3 +2302,357 @@ def calculate_feed_nutrition(req: NutritionRequest):
             fibre_desc
         ]
     }
+
+
+# ==============================================================================
+# 9. AI VISION (BCS + MASTITIS + DISEASE DETECTION) -> MOOPOSHAQ FEED BRIDGE
+# ==============================================================================
+
+DEFAULT_DIAGNOSIS_FEEDS: List[FeedItem] = [
+    FeedItem(name="Hybrid Napier (CO-4)", category="Green Fodder", quantityKg=25.0, dmPct=22.0),
+    FeedItem(name="Lucerne (Alfalfa)", category="Green Fodder", quantityKg=10.0, dmPct=24.0),
+    FeedItem(name="Wheat Straw", category="Dry Fodder", quantityKg=5.0, dmPct=90.0),
+    FeedItem(name="Maize Grain Crushed", category="Concentrates", quantityKg=4.0, dmPct=89.0),
+    FeedItem(name="Groundnut Cake", category="Concentrates", quantityKg=3.0, dmPct=90.0),
+    FeedItem(name="Wheat Bran", category="Concentrates", quantityKg=3.0, dmPct=89.0),
+    FeedItem(name="Cane Molasses", category="Unconventional", quantityKg=1.0, dmPct=75.0),
+]
+
+
+class DiagnosisFeedRequest(BaseModel):
+    bcs: float = Field(default=2.25, description="Detected or entered BCS score (1.0 to 5.0)")
+    mastitisStatus: Optional[str] = Field(default="healthy", description="Mastitis model output (healthy, subclinical_mastitis, clinical_mastitis)")
+    diseases: Optional[List[str]] = Field(default=[], description="Disease model output codes (e.g. lumpy_skin_disease, fmd_recovery, tick_fever_recovery, ketosis, rumen_acidosis, milk_fever, lameness, bloat_indigestion)")
+    category: Optional[str] = "milkingCow"
+    weight: Optional[float] = 450.0
+    milkYield: Optional[float] = 12.0
+    milkFat: Optional[float] = 4.2
+    stage: Optional[str] = "Mid lactation"
+    isFirstLactation: Optional[bool] = False
+    pregMonth: Optional[int] = 7
+    dryDays: Optional[int] = 45
+    selectedBreed: Optional[BreedInfo] = None
+    weather: Optional[WeatherPayload] = None
+    selectedFeeds: Optional[List[FeedItem]] = []
+
+
+def _generate_mooposhaq_cow_diagnosis_report(diag_req: DiagnosisFeedRequest) -> Dict[str, Any]:
+    """
+    Runs Mooposhaq's full NASEM 2021 nutrition solver for the cow under two states:
+    1. Baseline State (Optimal BCS for stage & Healthy)
+    2. Diagnosed State (Actual BCS with conditioning enabled + Mastitis & Disease interventions)
+    and returns the exact ingredient-by-ingredient Mooposhaq feed changes + therapeutic prescription.
+    """
+    cat = str(diag_req.category or "milkingCow")
+    bw = float(diag_req.weight or 450.0)
+    milk = float(diag_req.milkYield if diag_req.milkYield is not None else 12.0)
+    fat = float(diag_req.milkFat if diag_req.milkFat is not None else 4.2)
+    stg = str(diag_req.stage or "Mid lactation")
+    bcs_val = float(diag_req.bcs if diag_req.bcs is not None else 3.0)
+    mast_code = normalize_disease_code(diag_req.mastitisStatus)
+    dis_codes = [normalize_disease_code(d) for d in (diag_req.diseases or []) if normalize_disease_code(d) != "healthy"]
+
+    feeds_to_use = diag_req.selectedFeeds if (diag_req.selectedFeeds and len(diag_req.selectedFeeds) > 0) else DEFAULT_DIAGNOSIS_FEEDS
+    using_default_feeds = not (diag_req.selectedFeeds and len(diag_req.selectedFeeds) > 0)
+
+    breed_obj = diag_req.selectedBreed or BreedInfo(id="sahiwal", name="Sahiwal", avgWeightCow=bw)
+    weather_obj = diag_req.weather or WeatherPayload(tempC=29.0, humidity=65.0, condition="Clear", city="Farm")
+
+    # Determine target BCS for baseline comparison
+    bcs_check = calculate_bcs_nutrition_adjustment(bcs_val, bw=bw, category=cat, stage=stg)
+    target_bcs = bcs_check["targetBcs"]
+
+    def _build_single_cow_nutrition_req(use_bcs: float, use_mast: str, use_dis: List[str], apply_cond: bool) -> NutritionRequest:
+        item = AnimalItem(
+            id="scanned_cow_1",
+            weight=bw,
+            milkYield=milk,
+            milkFat=fat,
+            fatPct=fat,
+            bcs=use_bcs,
+            stage=stg,
+            isFirstLactation=bool(diag_req.isFirstLactation),
+            lactationType="first_lactation" if diag_req.isFirstLactation else "second_plus",
+            pregMonth=diag_req.pregMonth or 7,
+            dryDays=diag_req.dryDays or 45,
+            mastitisStatus=use_mast,
+            diseases=use_dis,
+            applyBcsConditioning=apply_cond
+        )
+        cat_l = cat.lower()
+        return NutritionRequest(
+            weather=weather_obj,
+            selectedBreed=breed_obj,
+            lactatingData=[item] if ("milk" in cat_l or "lact" in cat_l) else [],
+            firstTimeCattle=[item] if ("preg" in cat_l and diag_req.isFirstLactation) else [],
+            repeatCattle=[item] if ("preg" in cat_l and not diag_req.isFirstLactation) else [],
+            heifersData=[item] if "heif" in cat_l else [],
+            dryCowsData=[item] if "dry" in cat_l else [],
+            bullsData=[item] if "bull" in cat_l else [],
+            grazingSystem="no_grazing",
+            waterVolume=150.0,
+            selectedFeeds=feeds_to_use
+        )
+
+    base_res = calculate_feed_nutrition(_build_single_cow_nutrition_req(target_bcs, "healthy", [], False))
+    adj_res = calculate_feed_nutrition(_build_single_cow_nutrition_req(bcs_val, mast_code, dis_codes, True))
+
+    def _extract_first_animal(calc_output: Dict[str, Any]) -> Dict[str, Any]:
+        per_cat = calc_output.get("practicalFeedingReport", {}).get("perCategory", {})
+        for c_data in per_cat.values():
+            anims = c_data.get("animals") or []
+            if anims:
+                return anims[0]
+        return {}
+
+    base_anim = _extract_first_animal(base_res)
+    adj_anim = _extract_first_animal(adj_res)
+
+    # Compare ingredient-by-ingredient between baseline healthy ration and BCS/Disease-improved ration
+    feed_comparison = []
+    base_ing = base_anim.get("feedIngredients", {})
+    adj_ing = adj_anim.get("feedIngredients", {})
+    for f in feeds_to_use:
+        fname = f.name
+        b_kg = float(base_ing.get(fname, 0.0))
+        a_kg = float(adj_ing.get(fname, 0.0))
+        delta_kg = round(a_kg - b_kg, 1)
+        if b_kg > 0 or a_kg > 0:
+            feed_comparison.append({
+                "name": fname,
+                "category": f.category or "Feed",
+                "baselineIdealBcsKg": b_kg,
+                "recommendedTherapeuticKg": a_kg,
+                "deltaKg": delta_kg,
+                "action": "increase" if delta_kg > 0.1 else ("reduce" if delta_kg < -0.1 else "maintain")
+            })
+
+    hp = adj_anim.get("healthNutritionPlan") or build_combined_cow_health_prescription(
+        bcs=bcs_val,
+        bw=bw,
+        category=cat,
+        stage=stg,
+        milk_yield=milk,
+        milk_fat=fat,
+        mastitis_status=mast_code,
+        disease_codes=dis_codes,
+        selected_feeds=[{"name": f.name, "category": f.category, "quantityKg": f.quantityKg, "dmPct": f.dmPct} for f in feeds_to_use]
+    )
+
+    return {
+        "success": True,
+        "usingDefaultFeedBasket": using_default_feeds,
+        "cowProfile": {
+            "category": cat,
+            "weightKg": bw,
+            "milkYieldL": milk,
+            "milkFatPct": fat,
+            "stage": stg,
+            "currentBcs": bcs_val,
+            "targetBcs": target_bcs,
+            "mastitisStatus": mast_code,
+            "detectedDiseases": dis_codes
+        },
+        "bcsEvaluation": hp["bcsEvaluation"],
+        "activeDiagnoses": hp["activeDiagnoses"],
+        "quantitativeModifiers": hp["quantitativeModifiers"],
+        "farmSpecificFeedAdvice": hp["farmSpecificFeedAdvice"],
+        "therapeuticSupplements": hp["therapeuticSupplements"],
+        "mooposhaqRationComparison": {
+            "baselineRation": {
+                "greenFodderKg": base_anim.get("greenFodderKg", 0.0),
+                "greenFodderDetails": base_anim.get("greenFodderDetails", ""),
+                "dryFodderKg": base_anim.get("dryFodderKg", 0.0),
+                "dryFodderDetails": base_anim.get("dryFodderDetails", ""),
+                "concentrateKg": base_anim.get("concentrateKg", 0.0),
+                "concentrateDetails": base_anim.get("concentrateDetails", ""),
+                "mineralMixtureG": base_anim.get("mineralMixtureG", 60),
+                "saltG": base_anim.get("saltG", 35),
+                "waterLiters": base_anim.get("waterLiters", 60.0),
+                "meSuppliedMcal": base_anim.get("meSuppliedMcal", 0.0),
+                "cpSuppliedG": base_anim.get("cpSuppliedG", 0.0),
+                "dmiKg": base_anim.get("dmiKg", 0.0)
+            },
+            "therapeuticRecommendedRation": {
+                "greenFodderKg": adj_anim.get("greenFodderKg", 0.0),
+                "greenFodderDetails": adj_anim.get("greenFodderDetails", ""),
+                "dryFodderKg": adj_anim.get("dryFodderKg", 0.0),
+                "dryFodderDetails": adj_anim.get("dryFodderDetails", ""),
+                "concentrateKg": adj_anim.get("concentrateKg", 0.0),
+                "concentrateDetails": adj_anim.get("concentrateDetails", ""),
+                "concentrateDmPct": adj_anim.get("concentrateDmPct", 0.0),
+                "mineralMixtureG": adj_anim.get("mineralMixtureG", 60),
+                "saltG": adj_anim.get("saltG", 35),
+                "waterLiters": adj_anim.get("waterLiters", 60.0),
+                "meSuppliedMcal": adj_anim.get("meSuppliedMcal", 0.0),
+                "cpSuppliedG": adj_anim.get("cpSuppliedG", 0.0),
+                "dmiKg": adj_anim.get("dmiKg", 0.0),
+                "ndfPct": adj_anim.get("ndfPct", 32.0),
+                "targetMilkYieldL": adj_anim.get("targetMilkYieldL", milk)
+            },
+            "ingredientAdjustments": feed_comparison
+        }
+    }
+
+
+@app.get("/api/ai/diseases")
+def get_supported_ai_diseases_and_config():
+    """
+    Returns all supported Mastitis and Disease protocols that Mooposhaq can translate
+    into precision feed recommendations, along with external microservice endpoint status.
+    """
+    return {
+        "success": True,
+        "externalMicroservices": {
+            "bcsModelUrl": DEFAULT_BCS_MODEL_URL or None,
+            "mastitisModelUrl": DEFAULT_MASTITIS_MODEL_URL or None,
+            "diseaseModelUrl": DEFAULT_DISEASE_MODEL_URL or None,
+        },
+        "protocols": list(DISEASE_NUTRITION_PROTOCOLS.values())
+    }
+
+
+@app.post("/api/ai/recommend-from-diagnosis")
+def recommend_feed_from_diagnosis(req: DiagnosisFeedRequest):
+    """
+    Direct JSON endpoint linking BCS scoring output + Mastitis detection output +
+    Disease detection output directly to Mooposhaq's NASEM 2021 precision ration solver.
+    """
+    return _generate_mooposhaq_cow_diagnosis_report(req)
+
+
+@app.post("/api/ai/analyze-cow")
+async def analyze_cow_image_and_recommend_feed(
+    file: Optional[UploadFile] = File(default=None),
+    imageBase64: Optional[str] = Form(default=None),
+    category: Optional[str] = Form(default="milkingCow"),
+    weight: Optional[float] = Form(default=450.0),
+    milkYield: Optional[float] = Form(default=12.0),
+    milkFat: Optional[float] = Form(default=4.2),
+    stage: Optional[str] = Form(default="Mid lactation"),
+    isFirstLactation: Optional[bool] = Form(default=False),
+    pregMonth: Optional[int] = Form(default=7),
+    dryDays: Optional[int] = Form(default=45),
+    bcsModelUrl: Optional[str] = Form(default=None),
+    mastitisModelUrl: Optional[str] = Form(default=None),
+    diseaseModelUrl: Optional[str] = Form(default=None),
+    overrideBcs: Optional[float] = Form(default=None),
+    overrideMastitis: Optional[str] = Form(default=None),
+    overrideDiseasesJson: Optional[str] = Form(default=None),
+    selectedFeedsJson: Optional[str] = Form(default=None),
+    selectedBreedJson: Optional[str] = Form(default=None),
+    weatherJson: Optional[str] = Form(default=None),
+):
+    """
+    Accepts a picture of a cow, invokes the user's external BCS Scoring Model,
+    Mastitis Detection Model, and Disease Detection Model microservices, and returns
+    the complete Mooposhaq feed recommendation to improve BCS and treat/support any diagnosis.
+    """
+    image_bytes = b""
+    filename = "cow_upload.jpg"
+
+    if file is not None:
+        image_bytes = await file.read()
+        filename = file.filename or "cow_upload.jpg"
+    elif imageBase64:
+        raw_b64 = imageBase64.split(",")[-1] if "," in imageBase64 else imageBase64
+        try:
+            image_bytes = base64.b64decode(raw_b64)
+        except Exception:
+            image_bytes = b"invalid_b64"
+
+    override_dis_list: Optional[List[str]] = None
+    if overrideDiseasesJson:
+        try:
+            parsed_d = json.loads(overrideDiseasesJson)
+            if isinstance(parsed_d, list):
+                override_dis_list = [str(x) for x in parsed_d]
+            elif isinstance(parsed_d, str) and parsed_d.strip():
+                override_dis_list = [parsed_d.strip()]
+        except Exception:
+            override_dis_list = [overrideDiseasesJson]
+
+    # 1. Call External BCS, Mastitis, and Disease Microservices
+    model_results = run_all_external_models_on_image(
+        image_bytes=image_bytes,
+        filename=filename,
+        bcs_model_url=bcsModelUrl,
+        mastitis_model_url=mastitisModelUrl,
+        disease_model_url=diseaseModelUrl,
+        override_bcs=overrideBcs,
+        override_mastitis=overrideMastitis,
+        override_diseases=override_dis_list
+    )
+
+    # Parse farm feeds, breed, and weather if passed from frontend
+    parsed_feeds: List[FeedItem] = []
+    if selectedFeedsJson:
+        try:
+            raw_feeds = json.loads(selectedFeedsJson)
+            if isinstance(raw_feeds, list):
+                for rf in raw_feeds:
+                    if isinstance(rf, dict) and rf.get("name"):
+                        parsed_feeds.append(FeedItem(
+                            id=str(rf.get("id", "")),
+                            name=str(rf["name"]),
+                            category=str(rf.get("category", "Green Fodder")),
+                            quantityKg=float(rf.get("quantityKg", 10.0) or 10.0),
+                            dmPct=float(rf.get("dmPct", 25.0) or 25.0)
+                        ))
+        except Exception:
+            pass
+
+    parsed_breed: Optional[BreedInfo] = None
+    if selectedBreedJson:
+        try:
+            rb = json.loads(selectedBreedJson)
+            if isinstance(rb, dict):
+                parsed_breed = BreedInfo(
+                    id=str(rb.get("id", "sahiwal")),
+                    name=str(rb.get("name", "Sahiwal")),
+                    category=str(rb.get("category", "Cattle")),
+                    subCategory=str(rb.get("subCategory", "Dairy")),
+                    avgWeightHeifer=float(rb.get("avgWeightHeifer", 320.0) or 320.0),
+                    avgWeightCow=float(rb.get("avgWeightCow", 450.0) or 450.0)
+                )
+        except Exception:
+            pass
+
+    parsed_weather: Optional[WeatherPayload] = None
+    if weatherJson:
+        try:
+            rw = json.loads(weatherJson)
+            if isinstance(rw, dict):
+                parsed_weather = WeatherPayload(
+                    tempC=float(rw.get("tempC", 28.0) or 28.0),
+                    humidity=float(rw.get("humidity", 65.0) or 65.0),
+                    condition=str(rw.get("condition", "Clear")),
+                    city=str(rw.get("city", ""))
+                )
+        except Exception:
+            pass
+
+    # 2. Generate Mooposhaq Feed Recommendations from Model Outputs
+    diag_req = DiagnosisFeedRequest(
+        bcs=float(model_results["bcs"]["score"] or 3.0),
+        mastitisStatus=model_results["mastitis"]["status"],
+        diseases=model_results["diseases"]["detectedCodes"],
+        category=category,
+        weight=weight,
+        milkYield=milkYield,
+        milkFat=milkFat,
+        stage=stage,
+        isFirstLactation=isFirstLactation,
+        pregMonth=pregMonth,
+        dryDays=dryDays,
+        selectedBreed=parsed_breed,
+        weather=parsed_weather,
+        selectedFeeds=parsed_feeds
+    )
+
+    mooposhaq_report = _generate_mooposhaq_cow_diagnosis_report(diag_req)
+    return {
+        **mooposhaq_report,
+        "aiModelDetections": model_results
+    }
+

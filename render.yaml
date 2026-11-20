@@ -10,5 +10,11 @@ services:
         value: "1"
       - key: MKL_NUM_THREADS
         value: "1"
+      - key: BCS_MODEL_API_URL
+        value: ""
+      - key: MASTITIS_MODEL_API_URL
+        value: ""
+      - key: DISEASE_MODEL_API_URL
+        value: ""
     autoDeploy: true
     plan: free

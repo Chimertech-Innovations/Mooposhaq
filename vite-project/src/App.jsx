@@ -8,6 +8,7 @@ import Step7Grazing from './components/Step7Grazing';
 import Step8Water from './components/Step8Water';
 import Step9Feed from './components/Step9Feed';
 import Step10Review from './components/Step10Review';
+import AiVisionHealthModal from './components/AiVisionHealthModal';
 import { prewarmBackend } from './services/nutritionApi';
 
 import { CATTLE_BREEDS } from './data/breeds';
@@ -657,6 +658,69 @@ export default function App() {
     return getStepStatus(stepNumber) === 'complete';
   };
 
+  // AI Vision BCS & Disease Scanner Modal State
+  const [aiScannerModal, setAiScannerModal] = useState({
+    isOpen: false,
+    targetCow: null
+  });
+
+  const handleApplyAiScanToCow = (scannedResult) => {
+    const target = aiScannerModal.targetCow;
+    if (target && target.category === 'lactating' && typeof target.index === 'number') {
+      setLactatingData(prev => {
+        const next = [...prev];
+        if (next[target.index]) {
+          next[target.index] = {
+            ...next[target.index],
+            bcs: scannedResult.bcs,
+            mastitisStatus: scannedResult.mastitisStatus,
+            healthDiagnosis: scannedResult.healthDiagnosis,
+            diseases: scannedResult.diseases,
+            applyBcsConditioning: true
+          };
+        }
+        return next;
+      });
+      return;
+    }
+
+    // If opened globally from Navbar, update first lactating cow or add a new lactating cow with the scanned BCS & diagnosis
+    setLactatingData(prev => {
+      if (prev.length > 0) {
+        const next = [...prev];
+        next[0] = {
+          ...next[0],
+          bcs: scannedResult.bcs,
+          mastitisStatus: scannedResult.mastitisStatus,
+          healthDiagnosis: scannedResult.healthDiagnosis,
+          diseases: scannedResult.diseases,
+          applyBcsConditioning: true
+        };
+        return next;
+      }
+      return [
+        {
+          id: `lact_${Date.now()}`,
+          weight: scannedResult.weight || 450,
+          milkYield: scannedResult.milkYield || 12,
+          milkFat: scannedResult.milkFat || 4.2,
+          bcs: scannedResult.bcs,
+          stage: scannedResult.stage || 'Mid lactation',
+          isFirstLactation: false,
+          lactationType: 'second_plus',
+          mastitisStatus: scannedResult.mastitisStatus,
+          healthDiagnosis: scannedResult.healthDiagnosis,
+          diseases: scannedResult.diseases,
+          applyBcsConditioning: true
+        }
+      ];
+    });
+    if (currentStep === 1 || currentStep === 2) {
+      setHerdActiveStage('lactating');
+      setCurrentStep(2);
+    }
+  };
+
   return (
     <div data-lang={currentLang} style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg-page)' }}>
       {/* Top Navbar with Language Selector */}
@@ -672,6 +736,7 @@ export default function App() {
         setLang={setLanguage}
         showIosLocationHelp={showIosLocationHelp}
         setShowIosLocationHelp={setShowIosLocationHelp}
+        onOpenAiScanner={() => setAiScannerModal({ isOpen: true, targetCow: null })}
         t={t}
       />
 
@@ -734,6 +799,7 @@ export default function App() {
               setCurrentStep(3);
             }}
             onPrev={() => setCurrentStep(1)}
+            onOpenAiScannerForCow={(cowTarget) => setAiScannerModal({ isOpen: true, targetCow: cowTarget })}
             currentLang={currentLang}
             t={t}
           />
@@ -839,6 +905,18 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* AI Vision BCS, Mastitis & Disease -> Mooposhaq Feed Advisor Modal */}
+      <AiVisionHealthModal
+        isOpen={aiScannerModal.isOpen}
+        onClose={() => setAiScannerModal({ isOpen: false, targetCow: null })}
+        targetCow={aiScannerModal.targetCow}
+        onApplyToCow={handleApplyAiScanToCow}
+        selectedFeeds={selectedFeeds}
+        selectedBreed={selectedBreed}
+        weather={weather}
+        currentLang={currentLang}
+      />
 
       {/* Footer */}
       <footer style={{

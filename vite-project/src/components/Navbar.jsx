@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Thermometer, Droplets, Search, X, Globe, ChevronDown, Loader2, Smartphone, AlertCircle, Navigation, Info, Edit3, MapPin } from 'lucide-react';
+import { Thermometer, Droplets, Search, X, Globe, ChevronDown, Loader2, Smartphone, AlertCircle, Navigation, Info, Edit3, MapPin, Camera } from 'lucide-react';
 
 export default function Navbar({ 
   weather, 
@@ -14,6 +14,7 @@ export default function Navbar({
   setLang,
   showIosLocationHelp,
   setShowIosLocationHelp,
+  onOpenAiScanner,
   t
 }) {
   const [showManualModal, setShowManualModal] = useState(false);
@@ -214,13 +215,38 @@ export default function Navbar({
           </div>
         </div>
 
-        {/* RIGHT CONTROLS: Desktop Location Card + Detect GPS Button + Language Selector */}
+        {/* RIGHT CONTROLS: AI BCS & Health Scanner + Desktop Location Card + Detect GPS Button + Language Selector */}
         <div className="nav-controls" style={{ 
           display: 'flex', 
           alignItems: 'center', 
           gap: '8px', 
           flexWrap: 'nowrap'
         }}>
+          {onOpenAiScanner && (
+            <button
+              type="button"
+              onClick={onOpenAiScanner}
+              title="Scan Cow Photo for BCS, Mastitis & Disease Feed Recommendations"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                background: 'linear-gradient(135deg, #0284c7 0%, #1d4ed8 100%)',
+                color: '#ffffff',
+                border: 'none',
+                borderRadius: '20px',
+                padding: '6px 12px',
+                fontSize: '0.76rem',
+                fontWeight: 800,
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+                boxShadow: '0 2px 6px rgba(2, 132, 199, 0.28)'
+              }}
+            >
+              <Camera size={14} />
+              <span>{currentLang === 'ta' ? 'AI BCS & நோய் தீவனம்' : currentLang === 'hi' ? 'AI BCS व रोग आहार' : 'AI BCS & Health Feed'}</span>
+            </button>
+          )}
           
           {/* Desktop Location Card (Hidden on Mobile < 768px via CSS) */}
           <div 
